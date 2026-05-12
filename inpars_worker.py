@@ -28,6 +28,10 @@ SHEETS_OBJECTS_WEBHOOK  = os.environ.get("SHEETS_OBJECTS_WEBHOOK", "").strip()
 # Как часто опрашиваем API (в секундах)
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))  # 5 минут
 
+# Тестовый режим: при старте присылаем последние N объявлений (для проверки схемы)
+# 0 = выключено (нормальный режим). После теста убрать переменную с Railway.
+TEST_INITIAL_DUMP = int(os.environ.get("TEST_INITIAL_DUMP", "0"))
+
 # ---------- Фильтры (ваши настройки) ----------
 INPARS_FILTERS = {
     "regionId":   77,           # Москва
@@ -263,6 +267,21 @@ async def get_initial_last_id(client: httpx.AsyncClient) -> int:
     return 0
 
 
+async def fetch_recent_for_test(client: httpx.AsyncClient, n: int) -> list[dict]:
+    """Тестовый режим: достаёт N последних объявлений, прошедших наши фильтры.
+    Может потребовать несколько запросов, если часть отсеется."""
+    params = dict(INPARS_FILTERS)
+    params["sortBy"] = "id_desc"
+    params["limit"] = max(n * 5, 50)  # запрашиваем с запасом
+    params["expand"] = "rentTime,isApartments,rooms,district,metro"
+    data = await inpars_request(client, "/estate", params)
+    listings = data.get("data", [])
+
+    # Применяем те же фильтры, что и в основном цикле
+    passing = [l for l in listings if passes_filters(l)]
+    return passing[:n]
+
+
 # ---------- Главный цикл опроса ----------
 async def polling_loop(application: Application) -> None:
     """Каждые POLL_INTERVAL_SECONDS опрашиваем Inpars и шлём свежие лиды."""
@@ -280,6 +299,49 @@ async def polling_loop(application: Application) -> None:
             last_seen_id_state["value"] = await get_initial_last_id(client)
         except Exception:
             logger.exception("Не удалось получить стартовый last_id")
+
+        # ТЕСТОВЫЙ РЕЖИМ: присылаем N последних объявлений для проверки схемы
+        if TEST_INITIAL_DUMP > 0:
+            logger.info(f"🧪 ТЕСТОВЫЙ ДАМП: запрашиваю {TEST_INITIAL_DUMP} последних объявлений")
+            try:
+                test_listings = await fetch_recent_for_test(client, TEST_INITIAL_DUMP)
+                logger.info(f"🧪 Получено {len(test_listings)} объявлений после фильтрации")
+
+                # Отправляем "пометку" в чат, чтобы команда понимала, что это тест
+                try:
+                    await application.bot.send_message(
+                        chat_id=OBJECTS_CHAT_ID,
+                        text=(
+                            f"🧪 *Тестовый запуск*\n"
+                            f"Сейчас придёт {len(test_listings)} последних объявлений из Inpars, "
+                            f"чтобы убедиться, что всё работает. Дальше — только новые в реальном времени."
+                        ),
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    logger.exception("Не удалось отправить пометку о тестовом дампе")
+
+                for listing in test_listings:
+                    listing_id = listing.get("id", 0)
+                    try:
+                        text = format_listing_message(listing)
+                        await application.bot.send_message(
+                            chat_id=OBJECTS_CHAT_ID,
+                            text=text,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=False,
+                            reply_markup=make_action_keyboard(listing_id),
+                        )
+                    except Exception:
+                        logger.exception(f"Не удалось отправить тестовый объект {listing_id}")
+
+                    sheets_payload = build_sheets_payload(listing)
+                    await send_to_sheets(client, sheets_payload)
+                    await asyncio.sleep(0.5)
+
+                logger.info("🧪 Тестовый дамп завершён. ВАЖНО: уберите TEST_INITIAL_DUMP с Railway!")
+            except Exception:
+                logger.exception("Ошибка в тестовом дампе")
 
         logger.info(f"Старт цикла опроса с интервалом {POLL_INTERVAL_SECONDS} с")
 
