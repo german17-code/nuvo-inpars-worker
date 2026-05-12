@@ -12,12 +12,21 @@ NuVo Inpars Worker — сервис автоматического сбора о
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+
+# ---------- Часовой пояс для всех временных меток ----------
+# Москва (UTC+3). Без перевода на летнее время.
+MSK = timezone(timedelta(hours=3))
+
+
+def now_msk_str() -> str:
+    """Возвращает текущее московское время в формате 'YYYY-MM-DD HH:MM:SS'."""
+    return datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S")
 
 # ---------- Конфигурация ----------
 TELEGRAM_TOKEN          = os.environ["TELEGRAM_TOKEN"]
@@ -234,7 +243,7 @@ async def update_sheet_status(client: httpx.AsyncClient, listing_id: int, status
         "listing_id": listing_id,
         "status":     status,
         "manager":    manager,
-        "updated":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated":    now_msk_str(),
     }
     try:
         await client.post(
@@ -404,7 +413,7 @@ def build_sheets_payload(listing: dict) -> dict:
     return {
         "action":      "add_listing",  # тип записи (Apps Script различит)
         "listing_id":  listing.get("id"),
-        "timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp":   now_msk_str(),
         "source":      SOURCE_LABELS.get(listing.get("sourceId"), listing.get("source", "")),
         "url":         listing.get("url", ""),
         "is_apt":      "Апартаменты" if listing.get("isApartments") else "Квартира",
@@ -494,3 +503,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
