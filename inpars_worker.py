@@ -185,10 +185,6 @@ def format_listing_message(listing: dict) -> str:
         else:
             phone_str = p
 
-    text = listing.get("text", "")
-    if len(text) > 300:
-        text = text[:297] + "…"
-
     parts = [
         f"💎 *{kind}*  ·  *{cost_str}*",
         f"📐 {sq} м²" + (f"  ·  {floor_str}" if floor_str else ""),
@@ -196,8 +192,6 @@ def format_listing_message(listing: dict) -> str:
     ]
     if location:
         parts.append(f"🚇 {location}")
-    parts.append("")
-    parts.append(f"_{text}_" if text else "")
     parts.append("")
     parts.append(f"👤 {name}" + (f"  ·  `{phone_str}`" if phone_str else ""))
     parts.append(f"🌐 [{source}]({url})")
@@ -427,7 +421,6 @@ def build_sheets_payload(listing: dict) -> dict:
         "metro":       listing.get("metro", ""),
         "name":        listing.get("name", ""),
         "phone":       phone,
-        "text":        (listing.get("text", "") or "")[:500],
         "commission":  rent_terms.get("commission", ""),
         "deposit":     rent_terms.get("deposit", ""),
         "status":      "новый",
@@ -503,4 +496,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
