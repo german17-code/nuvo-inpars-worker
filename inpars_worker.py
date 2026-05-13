@@ -2,11 +2,9 @@
 NuVo Inpars Worker — сервис автоматического сбора объявлений с Inpars API.
 
 Каждые N минут опрашивает Inpars, фильтрует по нашим параметрам,
-дедуплицирует через parseId+sourceId, отправляет:
+дедуплицирует через listing_id, отправляет:
   - в общий Telegram-чат с кнопками действий
   - в Google Sheets (тот же документ, лист "Объекты")
-
-Сервис независим от bot.py (бота-квалификатора), но пишет в ту же таблицу.
 """
 
 import os
@@ -19,14 +17,13 @@ import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
-# ---------- Часовой пояс для всех временных меток ----------
-# Москва (UTC+3). Без перевода на летнее время.
+# ---------- Часовой пояс ----------
 MSK = timezone(timedelta(hours=3))
-
 
 def now_msk_str() -> str:
     """Возвращает текущее московское время в формате 'YYYY-MM-DD HH:MM:SS'."""
     return datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S")
+
 
 # ---------- Конфигурация ----------
 TELEGRAM_TOKEN          = os.environ["TELEGRAM_TOKEN"]
@@ -34,32 +31,25 @@ INPARS_TOKEN            = os.environ["INPARS_TOKEN"]
 OBJECTS_CHAT_ID         = int(os.environ["OBJECTS_CHAT_ID"])
 SHEETS_OBJECTS_WEBHOOK  = os.environ.get("SHEETS_OBJECTS_WEBHOOK", "").strip()
 
-# Как часто опрашиваем API (в секундах)
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))  # 5 минут
-
-# Тестовый режим: при старте присылаем последние N объявлений (для проверки схемы)
-# 0 = выключено (нормальный режим). После теста убрать переменную с Railway.
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 TEST_INITIAL_DUMP = int(os.environ.get("TEST_INITIAL_DUMP", "0"))
 
-# ---------- Фильтры (ваши настройки) ----------
+# ---------- Фильтры ----------
 INPARS_FILTERS = {
-    "regionId":   77,           # Москва
-    "cityId":     1,            # Москва
-    "typeAd":     1,            # сдам (собственник сдаёт)
-    "sectionId":  6,            # жилая недвижимость (аренда)
-    "sellerType": 1,            # только собственник
-    "withPhoto":  1,            # только с фото
-    "costMin":    150000,       # от 150 000 ₽
-    # костMax не задан — без верхней границы
-    "sourceId":   "1,2,13,22",  # avito, cian, yandex.realty, domclick
-    "limit":      100,          # за один запрос — до 100 объявлений
-    "sortBy":     "id_desc",    # самые свежие первыми
+    "regionId":   77,
+    "cityId":     1,
+    "typeAd":     1,
+    "sectionId":  6,
+    "sellerType": 1,
+    "withPhoto":  1,
+    "costMin":    130000,
+    "sourceId":   "1,2,13,22",
+    "limit":      100,
+    "sortBy":     "id_desc",
 }
 
-# Категории "квартиры + апартаменты" — будут подставлены при старте после справочника
 ALLOWED_CATEGORY_IDS: set[int] = set()
 
-# Источники для красивого отображения
 SOURCE_LABELS = {
     1:  "Avito",
     2:  "Cian",
@@ -74,11 +64,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("inpars-worker")
 
-# ---------- Работа с Inpars API ----------
+
+# ---------- Inpars API ----------
 INPARS_BASE = "https://inpars.ru/api/v2"
 
 async def inpars_request(client: httpx.AsyncClient, path: str, params: dict | None = None) -> dict:
-    """Запрос к Inpars API. Токен передаём в access-token."""
     p = dict(params or {})
     p["access-token"] = INPARS_TOKEN
     r = await client.get(f"{INPARS_BASE}{path}", params=p, timeout=30.0)
@@ -87,35 +77,23 @@ async def inpars_request(client: httpx.AsyncClient, path: str, params: dict | No
 
 
 async def load_category_ids(client: httpx.AsyncClient) -> set[int]:
-    """Загружаем справочник категорий и находим ID для 'Квартира' и 'Апартаменты'.
-
-    Inpars в `category` для аренды (typeId=1) возвращает категории квартир/комнат/домов.
-    Нам нужны те, чьё название содержит 'квартир' или 'апартамент'.
-    """
     data = await inpars_request(client, "/estate/category", {"sectionId": 6})
     ids = set()
     for c in data.get("data", []):
         title = (c.get("title") or "").lower()
-        # Берём всё, что про квартиры (1-к, 2-к, 3-к, 4+, студия)
-        # и про апартаменты. Не берём комнаты, дома, гаражи.
         if "квартир" in title or "апартамент" in title or "студи" in title:
             ids.add(c["id"])
             logger.info(f"Категория [{c['id']}] {c['title']} — включена")
     if not ids:
-        logger.warning("Не нашли подходящих категорий — фильтр по категориям отключён")
+        logger.warning("Не нашли подходящих категорий")
     return ids
 
 
 async def fetch_new_listings(client: httpx.AsyncClient, last_seen_id: int) -> list[dict]:
-    """Получаем свежие объявления, начиная с lastId (если задан).
-    Возвращаем список объявлений с rentTime для фильтрации посуточных.
-    """
     params = dict(INPARS_FILTERS)
     if last_seen_id:
         params["lastId"] = last_seen_id
-        params["sortBy"] = "id_asc"  # при использовании lastId — только id_asc/id_desc
-
-    # expand=rentTime,isApartments,rooms — нужны для финальной фильтрации и отображения
+        params["sortBy"] = "id_asc"
     params["expand"] = "rentTime,isApartments,rooms,district,metro"
 
     data = await inpars_request(client, "/estate", params)
@@ -125,26 +103,17 @@ async def fetch_new_listings(client: httpx.AsyncClient, last_seen_id: int) -> li
 
 
 def passes_filters(listing: dict) -> bool:
-    """Финальная фильтрация на нашей стороне (Inpars не умеет всё сам)."""
-    # 1. Только длительная аренда (rentTime: 1=длит, 2=посуточно, 0=не указан)
-    rent_time = listing.get("rentTime")
-    if rent_time == 2:  # посуточно — отбрасываем
+    if listing.get("rentTime") == 2:
         return False
-
-    # 2. Категория — квартира/апартаменты/студия (если справочник загрузился)
     if ALLOWED_CATEGORY_IDS and listing.get("categoryId") not in ALLOWED_CATEGORY_IDS:
         return False
-
-    # 3. Двойной контроль "только собственник" — на случай если API кто-то "проскочил"
     if listing.get("agent") != 0:
         return False
-
     return True
 
 
-# ---------- Telegram: формирование сообщения ----------
+# ---------- Сообщение в Telegram ----------
 def format_listing_message(listing: dict) -> str:
-    """Формирует красивое сообщение об объявлении для Telegram."""
     cost = listing.get("cost", 0)
     cost_str = f"{cost:,}".replace(",", " ") + " ₽/мес" if cost else "цена не указана"
 
@@ -152,7 +121,6 @@ def format_listing_message(listing: dict) -> str:
     is_apt = listing.get("isApartments")
     title = listing.get("title", "")
 
-    # Тип объекта
     if is_apt:
         kind = f"{rooms}-к апартаменты" if rooms else "Апартаменты"
     elif rooms:
@@ -168,7 +136,6 @@ def format_listing_message(listing: dict) -> str:
     address = listing.get("address", "—")
     metro = listing.get("metro", "")
     district = listing.get("district", "")
-
     location = ", ".join(filter(None, [district, metro]))
 
     source = SOURCE_LABELS.get(listing.get("sourceId"), listing.get("source", "?"))
@@ -178,7 +145,6 @@ def format_listing_message(listing: dict) -> str:
     phones = listing.get("phones") or []
     phone_str = ""
     if phones:
-        # phones — массив чисел, форматируем первый
         p = str(phones[0])
         if p.startswith("7") and len(p) == 11:
             phone_str = f"+7 ({p[1:4]}) {p[4:7]}-{p[7:9]}-{p[9:11]}"
@@ -200,7 +166,6 @@ def format_listing_message(listing: dict) -> str:
 
 
 def make_action_keyboard(listing_id: int) -> InlineKeyboardMarkup:
-    """Кнопки под объявлением. callback_data вида 'lead:<action>:<listing_id>'."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Взять в работу",  callback_data=f"lead:take:{listing_id}"),
@@ -212,9 +177,8 @@ def make_action_keyboard(listing_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-# ---------- Запись в Google Sheets ----------
+# ---------- Google Sheets ----------
 async def send_to_sheets(client: httpx.AsyncClient, payload: dict) -> None:
-    """Отправляет объявление в Google Sheets через Apps Script Webhook."""
     if not SHEETS_OBJECTS_WEBHOOK:
         return
     try:
@@ -229,7 +193,6 @@ async def send_to_sheets(client: httpx.AsyncClient, payload: dict) -> None:
 
 
 async def update_sheet_status(client: httpx.AsyncClient, listing_id: int, status: str, manager: str) -> None:
-    """Отправляет в Sheets команду: обновить статус по listing_id."""
     if not SHEETS_OBJECTS_WEBHOOK:
         return
     payload = {
@@ -248,16 +211,44 @@ async def update_sheet_status(client: httpx.AsyncClient, listing_id: int, status
         logger.exception("Не удалось обновить статус в Sheets")
 
 
-# ---------- Дедупликация: помним последний обработанный id ----------
-# Между перезапусками сервиса состояние теряется, и мы можем заново увидеть
-# объявления, уже обработанные раньше. Чтобы этого избежать, при старте
-# мы запросим у Inpars один объект и возьмём его id как стартовую точку
-# (т.е. при первом запуске мы пропустим всё старое и начнём слушать только новое).
+# ---------- Подготовка данных для Sheets ----------
+def build_sheets_payload(listing: dict) -> dict:
+    phones = listing.get("phones") or []
+    phone = str(phones[0]) if phones else ""
+
+    rent_terms = listing.get("rentTerms") or {}
+    is_apt_str = "Апартаменты" if listing.get("isApartments") else "Квартира"
+
+    return {
+        "action":      "add_listing",
+        "listing_id":  listing.get("id"),
+        "timestamp":   now_msk_str(),
+        "status":      "новый",
+        "manager":     "",
+        "source":      SOURCE_LABELS.get(listing.get("sourceId"), listing.get("source", "")),
+        "url":         listing.get("url", ""),
+        "is_apt":      is_apt_str,
+        "rooms":       listing.get("rooms", ""),
+        "sq":          listing.get("sq", ""),
+        "cost":        listing.get("cost", ""),
+        "floor":       listing.get("floor", ""),
+        "floors":      listing.get("floors", ""),
+        "address":     listing.get("address", ""),
+        "district":    listing.get("district", ""),
+        "metro":       listing.get("metro", ""),
+        "name":        listing.get("name", ""),
+        "phone":       phone,
+        "commission":  rent_terms.get("commission", ""),
+        "deposit":     rent_terms.get("deposit", ""),
+        "comment":     "",
+    }
+
+
+# ---------- Дедупликация ----------
 last_seen_id_state: dict[str, int] = {"value": 0}
 
 
 async def get_initial_last_id(client: httpx.AsyncClient) -> int:
-    """При первом запуске берём id самого свежего объявления, чтобы не лить старьё."""
     params = dict(INPARS_FILTERS)
     params["sortBy"] = "id_desc"
     params["limit"] = 1
@@ -271,46 +262,38 @@ async def get_initial_last_id(client: httpx.AsyncClient) -> int:
 
 
 async def fetch_recent_for_test(client: httpx.AsyncClient, n: int) -> list[dict]:
-    """Тестовый режим: достаёт N последних объявлений, прошедших наши фильтры.
-    Может потребовать несколько запросов, если часть отсеется."""
     params = dict(INPARS_FILTERS)
     params["sortBy"] = "id_desc"
-    params["limit"] = max(n * 5, 50)  # запрашиваем с запасом
+    params["limit"] = max(n * 5, 50)
     params["expand"] = "rentTime,isApartments,rooms,district,metro"
     data = await inpars_request(client, "/estate", params)
     listings = data.get("data", [])
-
-    # Применяем те же фильтры, что и в основном цикле
     passing = [l for l in listings if passes_filters(l)]
     return passing[:n]
 
 
-# ---------- Главный цикл опроса ----------
+# ---------- Главный цикл ----------
 async def polling_loop(application: Application) -> None:
-    """Каждые POLL_INTERVAL_SECONDS опрашиваем Inpars и шлём свежие лиды."""
     async with httpx.AsyncClient() as client:
-        # Загружаем справочник категорий один раз при старте
         global ALLOWED_CATEGORY_IDS
         try:
             ALLOWED_CATEGORY_IDS = await load_category_ids(client)
         except Exception:
-            logger.exception("Не удалось загрузить категории — фильтрация по категориям отключена")
+            logger.exception("Не удалось загрузить категории")
             ALLOWED_CATEGORY_IDS = set()
 
-        # Берём стартовую точку
         try:
             last_seen_id_state["value"] = await get_initial_last_id(client)
         except Exception:
             logger.exception("Не удалось получить стартовый last_id")
 
-        # ТЕСТОВЫЙ РЕЖИМ: присылаем N последних объявлений для проверки схемы
+        # ТЕСТОВЫЙ РЕЖИМ
         if TEST_INITIAL_DUMP > 0:
-            logger.info(f"🧪 ТЕСТОВЫЙ ДАМП: запрашиваю {TEST_INITIAL_DUMP} последних объявлений")
+            logger.info(f"🧪 ТЕСТОВЫЙ ДАМП: запрашиваю {TEST_INITIAL_DUMP} объявлений")
             try:
                 test_listings = await fetch_recent_for_test(client, TEST_INITIAL_DUMP)
                 logger.info(f"🧪 Получено {len(test_listings)} объявлений после фильтрации")
 
-                # Отправляем "пометку" в чат, чтобы команда понимала, что это тест
                 try:
                     await application.bot.send_message(
                         chat_id=OBJECTS_CHAT_ID,
@@ -322,7 +305,7 @@ async def polling_loop(application: Application) -> None:
                         parse_mode="Markdown",
                     )
                 except Exception:
-                    logger.exception("Не удалось отправить пометку о тестовом дампе")
+                    logger.exception("Не удалось отправить пометку")
 
                 for listing in test_listings:
                     listing_id = listing.get("id", 0)
@@ -342,7 +325,7 @@ async def polling_loop(application: Application) -> None:
                     await send_to_sheets(client, sheets_payload)
                     await asyncio.sleep(0.5)
 
-                logger.info("🧪 Тестовый дамп завершён. ВАЖНО: уберите TEST_INITIAL_DUMP с Railway!")
+                logger.info("🧪 Тестовый дамп завершён.")
             except Exception:
                 logger.exception("Ошибка в тестовом дампе")
 
@@ -351,8 +334,6 @@ async def polling_loop(application: Application) -> None:
         while True:
             try:
                 listings = await fetch_new_listings(client, last_seen_id_state["value"])
-
-                # Сортируем по id_asc, чтобы обрабатывать в порядке появления
                 listings.sort(key=lambda x: x.get("id", 0))
 
                 new_max_id = last_seen_id_state["value"]
@@ -367,7 +348,6 @@ async def polling_loop(application: Application) -> None:
                     if not passes_filters(listing):
                         continue
 
-                    # Отправляем в Telegram
                     try:
                         text = format_listing_message(listing)
                         await application.bot.send_message(
@@ -379,13 +359,10 @@ async def polling_loop(application: Application) -> None:
                         )
                         shipped += 1
                     except Exception:
-                        logger.exception(f"Не удалось отправить объект {listing_id} в Telegram")
+                        logger.exception(f"Не удалось отправить объект {listing_id}")
 
-                    # Параллельно — в Google Sheets
                     sheets_payload = build_sheets_payload(listing)
                     await send_to_sheets(client, sheets_payload)
-
-                    # Не флудим — пауза между сообщениями
                     await asyncio.sleep(0.5)
 
                 last_seen_id_state["value"] = new_max_id
@@ -397,41 +374,8 @@ async def polling_loop(application: Application) -> None:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
-def build_sheets_payload(listing: dict) -> dict:
-    """Готовит словарь для записи в Sheets."""
-    phones = listing.get("phones") or []
-    phone = str(phones[0]) if phones else ""
-
-    rent_terms = listing.get("rentTerms") or {}
-
-    return {
-        "action":      "add_listing",  # тип записи (Apps Script различит)
-        "listing_id":  listing.get("id"),
-        "timestamp":   now_msk_str(),
-        "source":      SOURCE_LABELS.get(listing.get("sourceId"), listing.get("source", "")),
-        "url":         listing.get("url", ""),
-        "is_apt":      "Апартаменты" if listing.get("isApartments") else "Квартира",
-        "rooms":       listing.get("rooms", ""),
-        "sq":          listing.get("sq", ""),
-        "floor":       listing.get("floor", ""),
-        "floors":      listing.get("floors", ""),
-        "cost":        listing.get("cost", ""),
-        "address":     listing.get("address", ""),
-        "district":    listing.get("district", ""),
-        "metro":       listing.get("metro", ""),
-        "name":        listing.get("name", ""),
-        "phone":       phone,
-        "commission":  rent_terms.get("commission", ""),
-        "deposit":     rent_terms.get("deposit", ""),
-        "status":      "новый",
-        "manager":     "",
-        "comment":     "",
-    }
-
-
-# ---------- Обработчики кнопок Telegram ----------
+# ---------- Кнопки в Telegram ----------
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает нажатия 'Взять в работу / Перезвонить / Не подходит'."""
     query = update.callback_query
     await query.answer()
 
@@ -447,7 +391,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if user.username:
         manager_name = f"{manager_name} (@{user.username})"
 
-    # Маппим action → статус для Sheets и подпись в Telegram
     actions = {
         "take":  ("в работе",      f"✅ Взял в работу: {manager_name}"),
         "later": ("перезвонить",   f"⏰ Перезвонить позже — {manager_name}"),
@@ -455,26 +398,23 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
     status, footer = actions.get(action, ("неизвестно", "?"))
 
-    # Обновляем сообщение: добавляем подпись о действии и убираем кнопки
     new_text = (query.message.text_markdown or query.message.text or "") + f"\n\n— — —\n*{footer}*"
     try:
         await query.edit_message_text(
             text=new_text,
             parse_mode="Markdown",
             disable_web_page_preview=False,
-            reply_markup=None,  # убираем кнопки
+            reply_markup=None,
         )
     except Exception:
-        logger.exception("Не удалось отредактировать сообщение после нажатия кнопки")
+        logger.exception("Не удалось отредактировать сообщение")
 
-    # Шлём команду на обновление статуса в Sheets
     async with httpx.AsyncClient() as client:
         await update_sheet_status(client, listing_id, status, manager_name)
 
 
 # ---------- Точка входа ----------
 async def post_init(application: Application) -> None:
-    """Запускаем фоновый цикл опроса после старта бота."""
     asyncio.create_task(polling_loop(application))
     logger.info("Inpars worker готов к работе")
 
@@ -486,13 +426,11 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
-
-    # Кнопки lead:* (под объявлениями)
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^lead:"))
-
     logger.info("Запускаю Inpars worker...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
+
